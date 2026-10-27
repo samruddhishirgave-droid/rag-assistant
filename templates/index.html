@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notes Assistant</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#f6f7f9;margin:0;color:#1a1a1a}
+  .wrap{max-width:760px;margin:0 auto;padding:24px 14px}
+  h1{margin:0 0 4px} .sub{color:#555;margin:0 0 14px}
+  #chat{background:#fff;border:1px solid #ddd;border-radius:10px;height:440px;overflow-y:auto;padding:12px}
+  .m{margin:10px 0;line-height:1.5;white-space:pre-wrap}
+  .u{text-align:right;color:#1f5fd1}
+  .b{color:#222}
+  .err{color:#b00020;background:#fdecea;padding:8px 10px;border-radius:8px}
+  .wait{color:#666;font-style:italic}
+  details{font-size:13px;color:#444;margin-top:6px}
+  .src{background:#f3f6fb;border-radius:6px;padding:6px 8px;margin:4px 0;white-space:pre-wrap}
+  #row{display:flex;gap:6px;margin-top:10px}
+  #msg{flex:1;padding:10px;border:1px solid #ccc;border-radius:8px;font:inherit}
+  button{padding:10px 14px;border-radius:8px;border:1px solid #1f5fd1;background:#1f5fd1;color:#fff;font:inherit;cursor:pointer}
+  button.g{background:#fff;color:#1a1a1a;border-color:#ccc}
+  button:disabled{opacity:.6;cursor:not-allowed}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+  .chip{background:#fff;color:#1f5fd1;border:1px solid #c5d5f5;font-size:13px;padding:6px 10px}
+</style>
+</head>
+<body><div class="wrap">
+<h1>Notes Assistant</h1>
+<p class="sub">Ask questions about my agribusiness forecasting notes and my prompt engineering report. Answers come from these documents, with sources.</p>
+<div class="chips" id="chips"></div>
+<div id="chat"></div>
+<div id="row">
+  <input id="msg" maxlength="500" placeholder="Ask a question about the documents..." />
+  <button id="btn" onclick="send()">Ask</button>
+  <button class="g" onclick="resetChat()">New chat</button>
+</div>
+<script>
+let cid=null;
+const chat=document.getElementById("chat"),msg=document.getElementById("msg"),btn=document.getElementById("btn");
+const examples=[
+  "What was the cost-weighted MAE of the yield forecasting model?",
+  "Which district is the only red one in the reliability figure?",
+  "What was the schema match rate for V1 in the prompt engineering report?",
+  "Who won the 2011 cricket World Cup?"
+];
+document.getElementById("chips").innerHTML=examples.map(
+  (q,i)=>`<button class="chip" onclick="ask(${i})">${q}</button>`).join("");
+function ask(i){msg.value=examples[i];send();}
+msg.addEventListener("keydown",e=>{if(e.key==="Enter")send();});
+
+function add(cls,text){const d=document.createElement("div");d.className="m "+cls;d.textContent=text;
+  chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d;}
+
+async function send(){
+  const text=msg.value.trim();
+  if(!text){add("err","Please type a question.");return;}
+  if(text.length>500){add("err","Question is too long (max 500 characters).");return;}
+  add("u",text);msg.value="";btn.disabled=true;
+  const wait=add("wait","Searching the documents and thinking...");
+  try{
+    const res=await fetch("/chat",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({message:text,conversation_id:cid})});
+    const data=await res.json().catch(()=>({}));
+    wait.remove();
+    if(!res.ok){add("err",data.error||"Something went wrong. Please try again.");}
+    else{
+      cid=data.conversation_id;
+      const d=add("b",data.reply);
+      if(data.sources&&data.sources.length){
+        const det=document.createElement("details");
+        det.innerHTML="<summary>Sources ("+data.sources.length+")</summary>"+data.sources.map(
+          s=>`<div class="src">[${s.n}] ${s.source} #${s.chunk} (distance ${s.distance})\n${s.snippet.replace(/</g,"&lt;")}...</div>`).join("");
+        d.appendChild(det);
+      }
+    }
+  }catch(e){wait.remove();add("err","Could not reach the server. Check your connection and try again.");}
+  btn.disabled=false;msg.focus();chat.scrollTop=chat.scrollHeight;
+}
+async function resetChat(){
+  try{await fetch("/reset",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({conversation_id:cid})});}catch(e){}
+  cid=null;chat.innerHTML="";
+}
+</script></div></body></html>
