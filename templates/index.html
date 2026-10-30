@@ -390,27 +390,70 @@
   ["dragleave","drop"].forEach(function(t){ drop.addEventListener(t, function(e){ e.preventDefault(); drop.classList.remove("over"); }); });
   drop.addEventListener("drop", function(e){ if(e.dataTransfer.files.length) choose(e.dataTransfer.files[0]); });
 
+  function fetchTimeout(url, opts, ms){
+    const ctl = new AbortController();
+    const t = setTimeout(function(){ ctl.abort(); }, ms);
+    return fetch(url, Object.assign({}, opts, {signal: ctl.signal})).finally(function(){ clearTimeout(t); });
+  }
+  async function safeJson(res){ try{ return await res.json(); }catch(e){ return {}; } }
+  function httpMessage(status){
+    if(status === 413) return "This file is too large. The limit is 2 MB.";
+    if(status === 429) return "The server is busy. Please wait a minute and try again.";
+    if(status >= 500) return "The server is busy or waking up. Please wait a minute and try again.";
+    return "Upload failed. Please try again.";
+  }
+  const sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
+
+  async function pollJob(jobId){
+    const started = Date.now();
+    let failures = 0;
+    while(Date.now() - started < 150000){
+      await sleep(1200);
+      try{
+        const res = await fetchTimeout("/upload/" + jobId, {}, 15000);
+        const data = await safeJson(res);
+        if(!res.ok) throw new Error(data.error || httpMessage(res.status));
+        failures = 0;
+        if(data.status === "done") return data;
+        if(data.status === "error") throw new Error(data.error || "Could not process the file. Please try again.");
+        if(data.stage === "indexing" && data.total){
+          setStatus("Indexing your document: " + data.done + " of " + data.total + " passages done.", "busy");
+        }else if(data.stage === "reading"){
+          setStatus("Reading your document...", "busy");
+        }
+      }catch(e){
+        if(e.name === "AbortError" || e instanceof TypeError){
+          failures += 1;
+          if(failures >= 4) throw new Error("Lost connection to the server. Please try again.");
+        }else{
+          throw e;
+        }
+      }
+    }
+    throw new Error("Indexing is taking too long. Please try a shorter document.");
+  }
+
   upbtn.addEventListener("click", async function(){
     if(!pendingFile || busy) return;
     setBusy(true); upbtn.disabled = true;
-    setStatus("Reading and indexing your document. This can take a few seconds.", "busy");
+    setStatus("Uploading your file...", "busy");
     try{
       const fd = new FormData(); fd.append("file", pendingFile);
-      const res = await fetch("/upload", {method:"POST", body: fd});
-      const data = await res.json().catch(function(){ return {}; });
-      if(!res.ok){
-        setStatus(data.error || "Upload failed. Please try again.", "bad");
-      }else{
-        docId = data.doc_id; docName = data.name; cid = null;
-        $("docname").textContent = data.name;
-        $("docmeta").textContent = data.chunks + " passages indexed" + (data.truncated ? ", first 150,000 characters only" : "");
-        samplebtn.hidden = false;
-        pendingFile = null; fileIn.value = ""; picked.hidden = true;
-        setStatus("Ready. Ask a question about your document.", "ok");
-        showEmpty();
-      }
+      const res = await fetchTimeout("/upload", {method:"POST", body: fd}, 90000);
+      const first = await safeJson(res);
+      if(!res.ok) throw new Error(first.error || httpMessage(res.status));
+      const data = await pollJob(first.job_id);
+      docId = data.doc_id; docName = data.name; cid = null;
+      $("docname").textContent = data.name;
+      $("docmeta").textContent = data.chunks + " passages indexed" + (data.truncated ? ", first part of a long document only" : "");
+      samplebtn.hidden = false;
+      pendingFile = null; fileIn.value = ""; picked.hidden = true;
+      setStatus(data.truncated ? "Ready. The document was long, so only the first part was indexed." : "Ready. Ask a question about your document.", "ok");
+      showEmpty();
     }catch(e){
-      setStatus("Could not reach the server. Check your connection and try again.", "bad");
+      if(e.name === "AbortError") setStatus("The server did not respond in time. Please wait a minute and try again.", "bad");
+      else if(e instanceof TypeError) setStatus("Could not reach the server. Check your connection and try again.", "bad");
+      else setStatus(e.message || "Upload failed. Please try again.", "bad");
     }
     setBusy(false); upbtn.disabled = !pendingFile;
   });
