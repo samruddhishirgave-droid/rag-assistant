@@ -24,11 +24,13 @@ MAX_HISTORY = 6          # keep the last 6 messages
 MAX_INPUT = 500
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MIN_TEXT_CHARS = 200
-MAX_TEXT_CHARS = 60_000  # about 35 chunks: small enough to index in well under a minute
-MAX_CHUNKS = 40
-EMBED_BATCH = 10
-INDEX_DEADLINE = 100     # seconds before an upload is given up with a clear message
-MAX_RUNNING_JOBS = 2
+
+MAX_TEXT_CHARS = 16_000
+MAX_CHUNKS = 8
+EMBED_BATCH = 4
+INDEX_DEADLINE = 180
+MAX_RUNNING_JOBS = 1
+MAX_UPLOADS = 5
 MAX_UPLOADS = 20
 ALLOWED = {".txt", ".md", ".pdf"}
 
