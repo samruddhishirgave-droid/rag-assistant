@@ -12,7 +12,7 @@ load_dotenv()
 # A request timeout (milliseconds) so a slow Gemini call fails fast instead of hanging.
 client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY"),
-    http_options=types.HttpOptions(timeout=45_000),
+    http_options=types.HttpOptions(timeout=25_000),
 )
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024
