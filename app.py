@@ -1,43 +1,71 @@
-import os, io, uuid, time, threading
-from collections import OrderedDict
-import chromadb
+import os, io, re, sqlite3, uuid, time, threading
+from contextlib import contextmanager
+
+try:
+    import chromadb
+except ModuleNotFoundError:  # pragma: no cover - optional in local/test environments
+    chromadb = None
+
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template
-from google import genai
-from google.genai import errors, types
-from pypdf import PdfReader
+
+try:
+    from google import genai
+    from google.genai import errors, types
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - optional in local/test environments
+    genai = None
+    errors = None
+    types = None
+
+try:
+    from pypdf import PdfReader
+except ModuleNotFoundError:  # pragma: no cover - optional in local/test environments
+    PdfReader = None
+
 from ingest import chunk_text, EMBED_MODEL
 
 load_dotenv()
-# A request timeout (milliseconds) so a slow Gemini call fails fast instead of hanging.
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY"),
-    http_options=types.HttpOptions(timeout=25_000),
-)
+
+
+def get_client():
+    if not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+    if genai is None or types is None:
+        raise RuntimeError("google-genai is not installed.")
+    global client
+    if client is None:
+        client = genai.Client(
+            api_key=os.getenv("GEMINI_API_KEY"),
+            http_options=types.HttpOptions(timeout=45_000),
+        )
+    return client
+
+
+client = None
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024
 
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 TOP_K = 4
-MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "0.6"))  # cosine distance cut-off
+try:
+    MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "0.6"))  # cosine distance cut-off
+except ValueError:
+    MAX_DISTANCE = 0.6
 MAX_HISTORY = 6          # keep the last 6 messages
 MAX_INPUT = 500
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MIN_TEXT_CHARS = 200
-
-MAX_TEXT_CHARS = 16_000
-MAX_CHUNKS = 8
-EMBED_BATCH = 4
-INDEX_DEADLINE = 180
-MAX_RUNNING_JOBS = 1
-MAX_UPLOADS = 5
+MAX_TEXT_CHARS = 60_000  # about 35 chunks: small enough to index in well under a minute
+MAX_CHUNKS = 40
+EMBED_BATCH = 10
+INDEX_DEADLINE = 100     # seconds before an upload is given up with a clear message
+MAX_RUNNING_JOBS = 2
 MAX_UPLOADS = 20
 ALLOWED = {".txt", ".md", ".pdf"}
+CHROMA_PATH = os.getenv("CHROMA_PATH", "chroma_db")
+JOB_DB_PATH = os.getenv("UPLOAD_JOBS_DB", os.path.join(CHROMA_PATH, "upload_jobs.sqlite3"))
 
 conversations = {}            # conversation_id -> list of messages
-uploads = OrderedDict()       # doc_id -> {"name", "collection", "chunks"}
-jobs = {}                     # job_id -> progress of a background indexing job
-lock = threading.Lock()       # protects uploads / jobs
 db_lock = threading.Lock()    # protects Chroma writes
 
 SYSTEM_PROMPT = """You are 'Notes Assistant', a careful assistant that answers ONLY from the
@@ -61,29 +89,155 @@ Answer: I couldn't find that in my documents. I can answer questions about the f
 
 # Sample docs live in the "docs" collection (built by ingest.py at deploy time);
 # uploaded files live in temporary collections named "u_<id>".
-DB = chromadb.PersistentClient(path="chroma_db")
-for _c in DB.list_collections():
-    _name = _c if isinstance(_c, str) else _c.name
-    if _name.startswith("u_"):
+DB = None
+
+
+def get_db():
+    global DB
+    if chromadb is None:
+        raise RuntimeError("chromadb is not installed.")
+    if DB is None:
+        os.makedirs(CHROMA_PATH, exist_ok=True)
+        DB = chromadb.PersistentClient(path=CHROMA_PATH)
+    return DB
+
+
+@contextmanager
+def connect_job_db():
+    os.makedirs(os.path.dirname(os.path.abspath(JOB_DB_PATH)), exist_ok=True)
+    conn = sqlite3.connect(JOB_DB_PATH, timeout=30)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS upload_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                done INTEGER NOT NULL,
+                total INTEGER NOT NULL,
+                created REAL NOT NULL,
+                doc_id TEXT,
+                name TEXT,
+                chunks INTEGER,
+                truncated INTEGER,
+                error TEXT
+            )"""
+        )
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def create_job(job_id):
+    now = time.time()
+    with connect_job_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM upload_jobs WHERE status != 'running' AND created < ?",
+            (now - 900,),
+        )
+        conn.execute(
+            """UPDATE upload_jobs
+               SET status = 'error', stage = 'error',
+                   error = 'Upload processing was interrupted. Please upload the file again.'
+               WHERE status = 'running' AND created < ?""",
+            (now - 900,),
+        )
+        running = conn.execute(
+            "SELECT COUNT(*) FROM upload_jobs WHERE status = 'running'"
+        ).fetchone()[0]
+        if running >= MAX_RUNNING_JOBS:
+            return False
+        conn.execute(
+            """INSERT INTO upload_jobs (job_id, status, stage, done, total, created)
+               VALUES (?, 'running', 'queued', 0, 0, ?)""",
+            (job_id, now),
+        )
+    return True
+
+
+def update_job(job_id, **values):
+    allowed = {"status", "stage", "done", "total", "doc_id", "name", "chunks", "truncated", "error"}
+    if not values or not values.keys() <= allowed:
+        raise ValueError("Invalid upload job update.")
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with connect_job_db() as conn:
+        result = conn.execute(
+            f"UPDATE upload_jobs SET {assignments} WHERE job_id = ?",
+            (*values.values(), job_id),
+        )
+        if result.rowcount != 1:
+            raise RuntimeError(f"Upload job {job_id} no longer exists.")
+
+
+def get_job(job_id):
+    with connect_job_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM upload_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def prune_jobs():
+    cutoff = time.time() - 900
+    with connect_job_db() as conn:
+        conn.execute(
+            "DELETE FROM upload_jobs WHERE status != 'running' AND created < ?",
+            (cutoff,),
+        )
+        conn.execute(
+            """UPDATE upload_jobs
+               SET status = 'error', stage = 'error',
+                   error = 'Upload processing was interrupted. Please upload the file again.'
+               WHERE status = 'running' AND created < ?""",
+            (cutoff,),
+        )
+
+
+def prune_uploaded_collections(db):
+    uploaded = []
+    for collection in db.list_collections():
+        name = collection if isinstance(collection, str) else collection.name
+        if not name.startswith("u_"):
+            continue
+        metadata = db.get_collection(name).metadata or {}
+        if metadata.get("kind") == "upload":
+            uploaded.append((metadata.get("created", 0), name))
+    uploaded.sort()
+    for _, name in uploaded[:-MAX_UPLOADS]:
         try:
-            DB.delete_collection(_name)
-        except Exception:
-            pass
+            db.delete_collection(name)
+        except Exception as e:
+            print("UPLOAD CLEANUP ERROR:", repr(e))
+
+
+def api_error_code(error):
+    if errors is not None and isinstance(error, errors.APIError):
+        return getattr(error, "code", None)
+    return None
 
 
 def embed_batch(texts, task, retries=3):
     """Embed a small batch, waiting and retrying on rate limits or temporary errors."""
+    if errors is None or types is None:
+        raise RuntimeError("google-genai is not installed.")
+    c = get_client()
     delay = 4
     for attempt in range(retries + 1):
         try:
-            r = client.models.embed_content(
+            r = c.models.embed_content(
                 model=EMBED_MODEL,
                 contents=texts,
                 config=types.EmbedContentConfig(task_type=task),
             )
             return [e.values for e in r.embeddings]
         except errors.APIError as e:
-            if e.code in (429, 500, 503) and attempt < retries:
+            if getattr(e, "code", None) in (429, 500, 503) and attempt < retries:
                 time.sleep(delay)
                 delay *= 2
                 continue
@@ -95,6 +249,8 @@ def extract_text(filename, data):
     if ext not in ALLOWED:
         raise ValueError("Unsupported file type. Please upload a .txt, .md or .pdf file.")
     if ext == ".pdf":
+        if PdfReader is None:
+            raise ValueError("PDF reading support is unavailable. Install pypdf to upload PDFs.")
         try:
             reader = PdfReader(io.BytesIO(data))
             if reader.is_encrypted:
@@ -120,18 +276,10 @@ def retrieve(col, question):
     return list(zip(res["documents"][0], res["metadatas"][0], res["distances"][0]))
 
 
-def prune_jobs():
-    cutoff = time.time() - 900
-    with lock:
-        for jid in [j for j, v in jobs.items() if v["created"] < cutoff and v["status"] != "running"]:
-            jobs.pop(jid, None)
-
-
 def run_index_job(job_id, name, data):
-    job = jobs[job_id]
     started = time.time()
     try:
-        job["stage"] = "reading"
+        update_job(job_id, stage="reading")
         text = extract_text(name, data).strip()
         if len(text) < MIN_TEXT_CHARS:
             raise ValueError("Not enough readable text in this file (a scanned PDF has no text layer).")
@@ -142,46 +290,57 @@ def run_index_job(job_id, name, data):
             chunks = chunks[:MAX_CHUNKS]
             truncated = True
 
-        job["stage"] = "indexing"
-        job["total"] = len(chunks)
+        update_job(job_id, stage="indexing", total=len(chunks))
         vectors = []
         for i in range(0, len(chunks), EMBED_BATCH):
             if time.time() - started > INDEX_DEADLINE:
                 raise ValueError("Indexing took too long. Please try a shorter document.")
             vectors += embed_batch(chunks[i:i + EMBED_BATCH], "RETRIEVAL_DOCUMENT")
-            job["done"] = min(i + EMBED_BATCH, len(chunks))
+            update_job(job_id, done=min(i + EMBED_BATCH, len(chunks)))
 
         doc_id = uuid.uuid4().hex[:16]
         cname = "u_" + doc_id
+        db = get_db()
         with db_lock:
-            col = DB.create_collection(cname, metadata={"hnsw:space": "cosine"})
+            col = db.create_collection(
+                cname,
+                metadata={
+                    "hnsw:space": "cosine",
+                    "kind": "upload",
+                    "source": name,
+                    "created": time.time(),
+                    "chunks": len(chunks),
+                },
+            )
             col.add(
                 ids=[f"{doc_id}-{i}" for i in range(len(chunks))],
                 documents=chunks,
                 embeddings=vectors,
                 metadatas=[{"source": name, "chunk": i} for i in range(len(chunks))],
             )
-        with lock:
-            uploads[doc_id] = {"name": name, "collection": cname, "chunks": len(chunks)}
-            while len(uploads) > MAX_UPLOADS:
-                _, old = uploads.popitem(last=False)
-                try:
-                    with db_lock:
-                        DB.delete_collection(old["collection"])
-                except Exception:
-                    pass
-        job.update(status="done", doc_id=doc_id, name=name, chunks=len(chunks), truncated=truncated)
+        prune_uploaded_collections(db)
+        update_job(
+            job_id,
+            status="done",
+            stage="done",
+            doc_id=doc_id,
+            name=name,
+            chunks=len(chunks),
+            truncated=int(truncated),
+        )
 
     except ValueError as e:
-        job.update(status="error", error=str(e))
-    except errors.APIError as e:
-        print("EMBED ERROR:", e.code, e)
-        msg = ("Too many requests right now. Please wait a minute and upload again."
-               if e.code == 429 else "The AI service had a problem while reading your file. Please try again.")
-        job.update(status="error", error=msg)
+        update_job(job_id, status="error", stage="error", error=str(e))
     except Exception as e:
-        print("UPLOAD ERROR:", repr(e))
-        job.update(status="error", error="Could not process the file. Please try again.")
+        code = api_error_code(e)
+        if code is not None:
+            print("EMBED ERROR:", code, e)
+            msg = ("Too many requests right now. Please wait a minute and upload again."
+                   if code == 429 else "The AI service had a problem while reading your file. Please try again.")
+        else:
+            print("UPLOAD ERROR:", repr(e))
+            msg = "Could not process the file. Please try again."
+        update_job(job_id, status="error", stage="error", error=msg)
 
 
 @app.errorhandler(413)
@@ -201,6 +360,11 @@ def health():
 
 @app.route("/upload", methods=["POST"])
 def upload():
+    try:
+        get_client()
+    except RuntimeError as exc:
+        return jsonify(error=str(exc)), 503
+
     f = request.files.get("file")
     if not f or not f.filename:
         return jsonify(error="Please choose a file to upload."), 400
@@ -215,23 +379,21 @@ def upload():
         return jsonify(error="File is too large. The limit is 2 MB."), 413
 
     prune_jobs()
-    with lock:
-        running = sum(1 for v in jobs.values() if v["status"] == "running")
-        if running >= MAX_RUNNING_JOBS:
-            return jsonify(error="The server is busy indexing other uploads. Please try again in a minute."), 429
-        job_id = uuid.uuid4().hex[:16]
-        jobs[job_id] = {"status": "running", "stage": "queued", "done": 0, "total": 0,
-                        "created": time.time()}
+    job_id = uuid.uuid4().hex[:16]
+    if not create_job(job_id):
+        return jsonify(error="The server is busy indexing other uploads. Please try again in a minute."), 429
     threading.Thread(target=run_index_job, args=(job_id, name, data), daemon=True).start()
     return jsonify(job_id=job_id), 202
 
 
 @app.route("/upload/<job_id>")
 def upload_status(job_id):
-    job = jobs.get(job_id)
+    job = get_job(job_id)
     if not job:
         return jsonify(error="This upload was not found. Please upload the file again."), 404
     out = {k: v for k, v in job.items() if k != "created"}
+    if out.get("truncated") is not None:
+        out["truncated"] = bool(out["truncated"])
     return jsonify(out)
 
 
@@ -248,14 +410,26 @@ def chat():
 
     upload_name = None
     try:
+        try:
+            get_client()
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 503
+
+        db = get_db()
         if doc_id:
-            entry = uploads.get(doc_id)
-            if not entry:
+            if not isinstance(doc_id, str) or not re.fullmatch(r"[a-f0-9]{16}", doc_id):
                 return jsonify(error="Your uploaded document is no longer available. Please upload it again."), 404
-            col = DB.get_collection(entry["collection"])
-            upload_name = entry["name"]
+            collection_name = "u_" + doc_id
+            available = {
+                collection if isinstance(collection, str) else collection.name
+                for collection in db.list_collections()
+            }
+            if collection_name not in available:
+                return jsonify(error="Your uploaded document is no longer available. Please upload it again."), 404
+            col = db.get_collection(collection_name)
+            upload_name = (col.metadata or {}).get("source")
         else:
-            col = DB.get_collection("docs")
+            col = db.get_collection("docs")
 
         history = conversations.setdefault(cid, [])
         hits = retrieve(col, msg)
@@ -277,7 +451,7 @@ def chat():
             contents = [types.Content(role=h["role"], parts=[types.Part(text=h["text"])])
                         for h in history[-MAX_HISTORY:]]
             contents.append(types.Content(role="user", parts=[types.Part(text=user_turn)]))
-            r = client.models.generate_content(
+            r = get_client().models.generate_content(
                 model=MODEL, contents=contents,
                 config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.2),
             )
@@ -288,12 +462,13 @@ def chat():
         del history[:-MAX_HISTORY]
         return jsonify(reply=reply, sources=sources, conversation_id=cid)
 
-    except errors.APIError as e:
-        print("API ERROR:", e.code, e)
-        err = ("Too many requests right now. Please wait a moment and try again."
-               if e.code == 429 else "The AI service had a problem. Please try again.")
-        return jsonify(error=err), 502
     except Exception as e:
+        code = api_error_code(e)
+        if code is not None:
+            print("API ERROR:", code, e)
+            err = ("Too many requests right now. Please wait a moment and try again."
+                   if code == 429 else "The AI service had a problem. Please try again.")
+            return jsonify(error=err), 502
         print("ERROR:", repr(e))
         return jsonify(error="Something went wrong on the server. Please try again."), 500
 
